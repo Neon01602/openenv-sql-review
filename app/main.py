@@ -1,235 +1,138 @@
 """
-SQL Query Review — OpenEnv Environment
-FastAPI application exposing all required OpenEnv endpoints.
+SQL Query Review Environment — OpenEnv compliant FastAPI application.
+
+Domain: SQL code review. An agent acts as a senior data engineer reviewing
+submitted SQL queries for correctness, performance anti-patterns, and
+security vulnerabilities (SQL injection risks).
+
+This simulates a genuine daily workflow in data engineering teams.
 """
+
 from __future__ import annotations
 
+import os
+import time
+import uuid
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
-from app.models import Action, GraderResult, Observation, Reward
-from app.session import create_episode, get_episode
-from app.tasks import ACTION_SCHEMA, list_tasks, get_task, generate_task
-
-# ─────────────────────────────────────────────────────────────────────────────
-# App setup
-# ─────────────────────────────────────────────────────────────────────────────
+from .models import Action, Observation, Reward, TaskInfo
+from .session import SessionManager
+from .tasks import TASK_REGISTRY
 
 app = FastAPI(
-    title       = "SQL Query Review — OpenEnv",
-    description = (
-        "An OpenEnv-compliant reinforcement-learning environment that trains and "
-        "evaluates AI agents to perform SQL code review. "
-        "Agents review PostgreSQL queries for correctness bugs, performance "
-        "anti-patterns, and security vulnerabilities.\n\n"
-        "**6 hand-crafted tasks** (easy × 2, medium × 2, hard × 2) plus "
-        "**procedurally generated tasks** via `generated_<difficulty>_<seed>`."
-    ),
-    version     = "2.0.0",
+    title="SQL Query Review — OpenEnv",
+    description="An OpenEnv environment that trains agents to review SQL queries for correctness, performance, and security.",
+    version="1.0.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins     = ["*"],
-    allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
-)
+sessions = SessionManager()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Core OpenEnv endpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post(
-    "/reset",
-    response_model = Observation,
-    summary        = "Reset",
-    description    = (
-        "Start a new episode. Returns the initial observation.\n\n"
-        "Pass one of the 6 fixed task IDs or a procedurally generated task like "
-        "`generated_hard_42`."
-    ),
-)
-def reset(task_id: Optional[str] = Query(default="easy_correctness")) -> Observation:
-    try:
-        ep = create_episode(task_id or "easy_correctness")
-    except KeyError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    return ep.initial_observation()
+# ─────────────────────────────────────────────
 
 
-@app.post(
-    "/step",
-    summary     = "Step",
-    description = "Apply an agent action to the current episode. Returns observation, reward, done, info.",
-)
-def step(action: Action) -> dict[str, Any]:
-    try:
-        ep = get_episode(action.session_id)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    try:
-        obs, reward, done, info = ep.step(action)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.post("/reset", response_model=Observation)
+def reset(task_id: Optional[str] = None):
+    """Start a new episode. Returns the initial observation."""
+    if task_id is None:
+        task_id = "easy_correctness"
+    if task_id not in TASK_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown task_id: {task_id}")
+
+    task = TASK_REGISTRY[task_id]
+    session_id = str(uuid.uuid4())
+    obs = sessions.new_session(session_id, task)
+    return obs
+
+
+@app.post("/step", response_model=dict)
+def step(action: Action):
+    """
+    Apply an agent action to the current episode.
+    Returns observation, reward, done, info.
+    """
+    session = sessions.get(action.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
+
+    obs, reward, done, info = session.step(action)
     return {
         "observation": obs.model_dump(),
-        "reward":      reward.model_dump(),
-        "done":        done,
-        "info":        info,
+        "reward": reward.model_dump(),
+        "done": done,
+        "info": info,
     }
 
 
-@app.get(
-    "/state",
-    summary     = "State",
-    description = "Return the full current state of an episode.",
-)
-def state(session_id: str = Query(...)) -> dict[str, Any]:
-    try:
-        ep = get_episode(session_id)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return ep.state()
+@app.get("/state")
+def state(session_id: str):
+    """Return the full current state of an episode."""
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return session.get_state()
 
 
-@app.get(
-    "/grader",
-    response_model = GraderResult,
-    summary        = "Grader",
-    description    = "Return the grader score for a completed episode.",
-)
-def grader(session_id: str = Query(...)) -> GraderResult:
-    try:
-        ep = get_episode(session_id)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return ep.grade()
+# ─────────────────────────────────────────────
+# Required extra endpoints
+# ─────────────────────────────────────────────
 
 
-@app.get(
-    "/tasks",
-    summary     = "List Tasks",
-    description = "Return the list of available tasks and the action schema.",
-)
-def tasks() -> dict[str, Any]:
+@app.get("/tasks")
+def list_tasks():
+    """Return all tasks and the action schema."""
     return {
-        "tasks":         list_tasks(),
-        "action_schema": ACTION_SCHEMA,
-        "procedural_tasks": {
-            "description": (
-                "Generate novel tasks by passing task_id=generated_<difficulty>_<seed> "
-                "to /reset. Example: generated_hard_42"
-            ),
-            "difficulties": ["easy", "medium", "hard"],
-            "example_ids":  [f"generated_{d}_{i}" for d, i in
-                             [("easy",7), ("medium",42), ("hard",99)]],
-        },
+        "tasks": [
+            {
+                "id": tid,
+                "name": t.name,
+                "difficulty": t.difficulty,
+                "description": t.description,
+                "max_steps": t.max_steps,
+            }
+            for tid, t in TASK_REGISTRY.items()
+        ],
+        "action_schema": Action.model_json_schema(),
     }
 
 
-@app.post(
-    "/baseline",
-    summary     = "Baseline",
-    description = (
-        "Run the heuristic baseline agent against all 6 fixed tasks. "
-        "No API key required. Scores are deterministic and reproducible."
-    ),
-)
-def baseline() -> dict[str, Any]:
-    from app.baseline import run_heuristic_baseline
+@app.get("/grader")
+def grader(session_id: str):
+    """Return the grader score for a completed episode."""
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    score = session.grade()
+    return {"session_id": session_id, "score": score, "task_id": session.task.task_id}
+
+
+@app.post("/baseline")
+def baseline():
+    """
+    Run the built-in heuristic baseline agent across all 3 tasks.
+    Returns reproducible scores (no LLM needed for the baseline gate).
+    """
+    from .baseline import run_heuristic_baseline
+
     results = run_heuristic_baseline()
-    avg = round(sum(r["score"] for r in results) / len(results), 4)
+    return {"baseline_results": results}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": time.time()}
+
+
+@app.get("/")
+def root():
     return {
-        "results": results,
-        "average_score": avg,
-        "agent": "heuristic_regex_v2",
-        "note": "Deterministic, no LLM required.",
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility endpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/health", summary="Health", description="Liveness probe.")
-def health() -> dict[str, str]:
-    # openenv validate requires status == "healthy" (not "ok")
-    return {"status": "healthy", "version": "2.0.0"}
-
-
-@app.get("/metadata", summary="Metadata", description="Environment metadata required by openenv validate.")
-def metadata() -> dict[str, Any]:
-    return {
-        "name":        "SQL Query Review",
-        "description": (
-            "An RL environment for training and evaluating agents on SQL code review. "
-            "Agents review PostgreSQL queries for correctness bugs, performance "
-            "anti-patterns, and security vulnerabilities."
-        ),
-        "version":   "2.0.0",
-        "spec":      "openenv-v1",
-        "tasks":     [t["id"] for t in list_tasks()],
-        "endpoints": ["/reset", "/step", "/state", "/grader", "/tasks",
-                      "/baseline", "/health", "/metadata", "/schema", "/mcp"],
-        "docs":      "/docs",
-    }
-
-
-@app.get("/schema", summary="Schema", description="Action, observation, and state schemas (required by openenv validate).")
-def schema() -> dict[str, Any]:
-    from app.models import Action, Observation
-    return {
-        "action":      Action.model_json_schema(),
-        "observation": Observation.model_json_schema(),
-        "state": {
-            "type": "object",
-            "properties": {
-                "session_id":        {"type": "string"},
-                "task_id":           {"type": "string"},
-                "step_number":       {"type": "integer"},
-                "max_steps":         {"type": "integer"},
-                "done":              {"type": "boolean"},
-                "cumulative_reward": {"type": "number"},
-                "agent_issues":      {"type": "array"},
-                "agent_decision":    {"type": ["string", "null"]},
-                "grade":             {"type": ["number", "null"]},
-            },
-        },
-    }
-
-
-@app.post("/mcp", summary="MCP", description="JSON-RPC 2.0 endpoint required by openenv validate.")
-def mcp(request: dict = {}) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id":      request.get("id", 1),
-        "result": {
-            "tools": [
-                {"name": "reset",  "description": "Start a new episode"},
-                {"name": "step",   "description": "Apply an agent action"},
-                {"name": "state",  "description": "Get current episode state"},
-                {"name": "grader", "description": "Get final episode score"},
-            ]
-        },
-    }
-
-
-@app.get("/", summary="Root", description="Environment metadata.")
-def root() -> dict[str, Any]:
-    return {
-        "name":        "SQL Query Review",
-        "version":     "2.0.0",
-        "spec":        "openenv-v1",
-        "description": (
-            "An RL environment for training and evaluating agents on SQL code review. "
-            "6 fixed tasks (easy → hard) + procedurally generated tasks."
-        ),
-        "tasks":     [t["id"] for t in list_tasks()],
-        "endpoints": ["/reset", "/step", "/state", "/grader", "/tasks",
-                      "/baseline", "/health", "/metadata", "/schema", "/mcp"],
-        "docs":      "/docs",
+        "environment": "SQL Query Review",
+        "version": "1.0.0",
+        "spec": "openenv-v1",
+        "endpoints": ["/reset", "/step", "/state", "/tasks", "/grader", "/baseline", "/health"],
     }
