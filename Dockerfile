@@ -7,11 +7,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY app/        ./app/
-COPY scripts/    ./scripts/
-COPY tests/      ./tests/
+COPY app/         ./app/
+COPY scripts/     ./scripts/
+COPY tests/       ./tests/
 COPY openenv.yaml .
 COPY README.md    .
+# inference.py must be at root per submission rules
+COPY inference.py .
 
 # Hugging Face Spaces runs as non-root
 RUN useradd -m -u 1000 appuser && chown -R appuser /app
