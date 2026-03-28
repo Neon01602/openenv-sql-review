@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """
-LLM-powered inference script for SQL Query Review OpenEnv.
+inference.py — LLM-powered inference script for SQL Query Review OpenEnv.
+
+Must be placed in the ROOT directory of the project (per submission rules).
+
+Required environment variables:
+    API_BASE_URL   The base URL of the running OpenEnv environment.
+                   e.g. https://neo0110-openenv-sql-review.hf.space
+    MODEL_NAME     The LLM model identifier.
+                   e.g. gpt-4o-mini
+    HF_TOKEN       Your Hugging Face / OpenAI API key.
 
 Usage:
-    export OPENAI_API_KEY=sk-...
-    export ENV_BASE_URL=https://neo0110-openenv-sql-review.hf.space   # or http://localhost:7860
-    python scripts/inference.py [--task all|easy_correctness|...]
+    export API_BASE_URL=https://neo0110-openenv-sql-review.hf.space
+    export MODEL_NAME=gpt-4o-mini
+    export HF_TOKEN=sk-...
+    python inference.py
 
 Results are written to baseline_results.json.
+Runtime target: < 20 minutes on vcpu=2, memory=8GB.
 """
 from __future__ import annotations
 
@@ -22,12 +33,13 @@ import requests
 from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config
+# Config — reads the three required submission env vars
 # ─────────────────────────────────────────────────────────────────────────────
 
-BASE_URL    = os.getenv("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
-OPENAI_KEY  = os.getenv("OPENAI_API_KEY", "")
-MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
+MODEL      = os.getenv("MODEL_NAME", "gpt-4o-mini")
+# HF_TOKEN is the required var name; fall back to OPENAI_API_KEY for local dev
+API_KEY    = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
 
 SYSTEM_PROMPT = """\
 You are a senior data engineer conducting a rigorous SQL code review.
@@ -118,7 +130,6 @@ def _call_llm(client: OpenAI, user_msg: str, retry: int = 3) -> dict:
                 max_tokens  = 1200,
             )
             raw = response.choices[0].message.content or ""
-            # Strip markdown fences if present
             raw = raw.strip()
             if raw.startswith("```"):
                 raw = "\n".join(raw.split("\n")[1:])
@@ -143,7 +154,6 @@ def run_task(task_id: str, client: OpenAI) -> dict[str, Any]:
     print(f"Task: {task_id}")
     print(f"{'='*60}")
 
-    # Reset
     obs = _env_post("/reset", params={"task_id": task_id})
     session_id = obs["session_id"]
     print(f"Session: {session_id}  (max_steps={obs['max_steps']})")
@@ -159,7 +169,6 @@ def run_task(task_id: str, client: OpenAI) -> dict[str, Any]:
         user_msg = _build_user_message(obs)
         llm_resp = _call_llm(client, user_msg)
 
-        # Clamp to valid values
         valid_cats = {"correctness", "performance", "security", "style"}
         valid_sevs = {"critical", "high", "medium", "low"}
         valid_decs = {"approve", "request_changes", "reject"}
@@ -200,21 +209,14 @@ def run_task(task_id: str, client: OpenAI) -> dict[str, Any]:
 
         print(f"  Reward: {reward['value']:.4f}  (cumulative={reward['cumulative']:.4f})")
         step_results.append({
-            "step":    step,
+            "step":     step,
             "n_issues": len(cleaned_issues),
             "decision": decision,
-            "reward":  reward["value"],
+            "reward":   reward["value"],
         })
 
-    # Grade
     grader = _env_get("/grader", params={"session_id": session_id})
     print(f"\nFinal score: {grader['score']:.4f}")
-    if "breakdown" in grader:
-        bd = grader["breakdown"]
-        print(f"  detection={bd.get('detection_score',0):.3f}  "
-              f"fp_mult={bd.get('fp_multiplier',0):.3f}  "
-              f"decision={bd.get('decision_score',0):.3f}  "
-              f"gt={bd.get('gt_detected',0)}/{bd.get('gt_total',0)}")
 
     return {
         "task_id":      task_id,
@@ -236,27 +238,42 @@ def main():
     parser.add_argument("--output", default="baseline_results.json")
     args = parser.parse_args()
 
-    if not OPENAI_KEY:
-        print("ERROR: OPENAI_API_KEY environment variable not set.")
+    # Validate required env vars
+    missing = []
+    if not API_KEY:
+        missing.append("HF_TOKEN (or OPENAI_API_KEY)")
+    if not os.getenv("API_BASE_URL"):
+        print(f"[warn] API_BASE_URL not set, defaulting to {BASE_URL}")
+    if not os.getenv("MODEL_NAME"):
+        print(f"[warn] MODEL_NAME not set, defaulting to {MODEL}")
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
 
-    client = OpenAI(api_key=OPENAI_KEY)
+    # Verify environment is reachable
+    try:
+        health = requests.get(f"{BASE_URL}/health", timeout=10).json()
+        print(f"Environment: {BASE_URL}  status={health.get('status')}")
+    except Exception as e:
+        print(f"ERROR: Cannot reach environment at {BASE_URL}: {e}")
+        sys.exit(1)
 
-    # Determine which tasks to run
+    client = OpenAI(api_key=API_KEY)
+
+    # Determine tasks to run
     if args.task == "all":
         tasks_response = requests.get(f"{BASE_URL}/tasks", timeout=10).json()
         task_ids = [t["id"] for t in tasks_response["tasks"]]
     else:
         task_ids = [args.task]
 
-    print(f"Running inference on {len(task_ids)} task(s) using model={MODEL}")
-    print(f"Environment: {BASE_URL}\n")
+    print(f"Running {len(task_ids)} task(s) with model={MODEL}\n")
 
     all_results = []
     for tid in task_ids:
         result = run_task(tid, client)
         all_results.append(result)
-        time.sleep(0.5)  # polite delay
+        time.sleep(0.5)
 
     avg = round(sum(r["score"] for r in all_results) / len(all_results), 4)
 
@@ -274,14 +291,10 @@ def main():
     print(f"Average score: {avg:.4f}")
     print(f"Results written to: {args.output}")
     print(f"{'='*60}")
-
-    # Print table
-    print(f"\n{'Task':<30} {'Difficulty':<12} {'Score':>6}")
-    print("-" * 52)
+    print(f"\n{'Task':<30} {'Score':>6}")
+    print("-" * 38)
     for r in all_results:
-        tid = r["task_id"]
-        diff = r["breakdown"].get("difficulty", "—")
-        print(f"{tid:<30} {diff:<12} {r['score']:>6.4f}")
+        print(f"{r['task_id']:<30} {r['score']:>6.4f}")
 
 
 if __name__ == "__main__":
