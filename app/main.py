@@ -157,14 +157,68 @@ def baseline() -> dict[str, Any]:
 
 @app.get("/health", summary="Health", description="Liveness probe.")
 def health() -> dict[str, str]:
-    return {"status": "ok", "version": "2.0.0"}
+    # openenv validate requires status == "healthy" (not "ok")
+    return {"status": "healthy", "version": "2.0.0"}
 
 
-@app.get(
-    "/",
-    summary     = "Root",
-    description = "Environment metadata.",
-)
+@app.get("/metadata", summary="Metadata", description="Environment metadata required by openenv validate.")
+def metadata() -> dict[str, Any]:
+    return {
+        "name":        "SQL Query Review",
+        "description": (
+            "An RL environment for training and evaluating agents on SQL code review. "
+            "Agents review PostgreSQL queries for correctness bugs, performance "
+            "anti-patterns, and security vulnerabilities."
+        ),
+        "version":   "2.0.0",
+        "spec":      "openenv-v1",
+        "tasks":     [t["id"] for t in list_tasks()],
+        "endpoints": ["/reset", "/step", "/state", "/grader", "/tasks",
+                      "/baseline", "/health", "/metadata", "/schema", "/mcp"],
+        "docs":      "/docs",
+    }
+
+
+@app.get("/schema", summary="Schema", description="Action, observation, and state schemas (required by openenv validate).")
+def schema() -> dict[str, Any]:
+    from app.models import Action, Observation
+    return {
+        "action":      Action.model_json_schema(),
+        "observation": Observation.model_json_schema(),
+        "state": {
+            "type": "object",
+            "properties": {
+                "session_id":        {"type": "string"},
+                "task_id":           {"type": "string"},
+                "step_number":       {"type": "integer"},
+                "max_steps":         {"type": "integer"},
+                "done":              {"type": "boolean"},
+                "cumulative_reward": {"type": "number"},
+                "agent_issues":      {"type": "array"},
+                "agent_decision":    {"type": ["string", "null"]},
+                "grade":             {"type": ["number", "null"]},
+            },
+        },
+    }
+
+
+@app.post("/mcp", summary="MCP", description="JSON-RPC 2.0 endpoint required by openenv validate.")
+def mcp(request: dict = {}) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id":      request.get("id", 1),
+        "result": {
+            "tools": [
+                {"name": "reset",  "description": "Start a new episode"},
+                {"name": "step",   "description": "Apply an agent action"},
+                {"name": "state",  "description": "Get current episode state"},
+                {"name": "grader", "description": "Get final episode score"},
+            ]
+        },
+    }
+
+
+@app.get("/", summary="Root", description="Environment metadata.")
 def root() -> dict[str, Any]:
     return {
         "name":        "SQL Query Review",
@@ -174,7 +228,8 @@ def root() -> dict[str, Any]:
             "An RL environment for training and evaluating agents on SQL code review. "
             "6 fixed tasks (easy → hard) + procedurally generated tasks."
         ),
-        "tasks":       [t["id"] for t in list_tasks()],
-        "endpoints":   ["/reset", "/step", "/state", "/grader", "/tasks", "/baseline", "/health"],
-        "docs":        "/docs",
+        "tasks":     [t["id"] for t in list_tasks()],
+        "endpoints": ["/reset", "/step", "/state", "/grader", "/tasks",
+                      "/baseline", "/health", "/metadata", "/schema", "/mcp"],
+        "docs":      "/docs",
     }
