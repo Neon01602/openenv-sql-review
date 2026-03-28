@@ -1,300 +1,236 @@
 #!/usr/bin/env python3
 """
-inference.py — LLM-powered inference script for SQL Query Review OpenEnv.
-
-Must be placed in the ROOT directory of the project (per submission rules).
-
-Required environment variables:
-    API_BASE_URL   The base URL of the running OpenEnv environment.
-                   e.g. https://neo0110-openenv-sql-review.hf.space
-    MODEL_NAME     The LLM model identifier.
-                   e.g. gpt-4o-mini
-    HF_TOKEN       Your Hugging Face / OpenAI API key.
+inference.py — OpenAI-powered agent against the SQL Query Review environment.
 
 Usage:
-    export API_BASE_URL=https://neo0110-openenv-sql-review.hf.space
-    export MODEL_NAME=gpt-4o-mini
-    export HF_TOKEN=sk-...
-    python inference.py
+    export OPENAI_API_KEY=sk-...
+    export ENV_BASE_URL=http://localhost:7860   # or HF Space URL
+    python scripts/inference.py
 
-Results are written to baseline_results.json.
-Runtime target: < 20 minutes on vcpu=2, memory=8GB.
+The agent is given the query + schema and prompted to act as a senior
+data engineer performing a code review. It iterates up to max_steps,
+submitting issues and a final decision.
+
+Expected approximate scores (gpt-4o-mini):
+  easy_correctness   → 0.70–0.85
+  medium_performance → 0.55–0.75
+  hard_security      → 0.45–0.65
 """
+
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import requests
 from openai import OpenAI
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config — reads the three required submission env vars
-# ─────────────────────────────────────────────────────────────────────────────
+BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+MAX_STEPS = 6
 
-BASE_URL   = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
-MODEL      = os.getenv("MODEL_NAME", "gpt-4o-mini")
-# HF_TOKEN is the required var name; fall back to OPENAI_API_KEY for local dev
-API_KEY    = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """\
-You are a senior data engineer conducting a rigorous SQL code review.
 
-You will be given:
-- A SQL query to review
-- The database schema (tables, columns, types, indexes)
-- Task instructions
+# ─────────────────────────────────────────────
+# Environment helpers
+# ─────────────────────────────────────────────
 
-Your job:
-1. Identify ALL correctness bugs, performance anti-patterns, and security vulnerabilities.
-2. For each issue provide: category, severity, description, and suggested_fix.
-3. After identifying issues, submit a final decision: approve | request_changes | reject.
+def env_reset(task_id: str) -> Dict:
+    resp = requests.post(f"{BASE_URL}/reset", params={"task_id": task_id})
+    resp.raise_for_status()
+    return resp.json()
 
-Categories: correctness | performance | security | style
-Severities: critical | high | medium | low
 
-Rules:
-- Only report real issues — do not invent issues that are not present.
-- A critical severity means data loss, corruption, or security breach is possible.
-- Reject if any critical issue exists; request_changes for high/medium; approve only if clean.
-- Be concise but precise in descriptions.
+def env_step(action: Dict) -> Dict:
+    resp = requests.post(f"{BASE_URL}/step", json=action)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def env_grade(session_id: str) -> float:
+    resp = requests.get(f"{BASE_URL}/grader", params={"session_id": session_id})
+    resp.raise_for_status()
+    return resp.json()["score"]
+
+
+# ─────────────────────────────────────────────
+# LLM agent
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a senior data engineer performing SQL code review.
+
+You will be given a SQL query and schema context. Your job is to:
+1. Identify ALL issues: correctness bugs, performance anti-patterns, security vulnerabilities.
+2. Rate each issue by severity: critical | high | medium | low.
+3. Categorize each issue: correctness | performance | security | style.
+4. Suggest a fix where possible.
+5. Submit a final decision: approve | request_changes | reject.
+
+DECISION RULES:
+- reject: any critical security or data-integrity issue
+- request_changes: high/medium issues but no critical ones  
+- approve: only if no real issues found
 
 Respond ONLY with valid JSON in this exact format:
 {
   "issues": [
     {
-      "category": "...",
-      "severity": "...",
-      "description": "...",
-      "suggested_fix": "..."
+      "category": "security|correctness|performance|style",
+      "severity": "critical|high|medium|low",
+      "line_hint": null,
+      "description": "Clear description of the issue",
+      "suggested_fix": "How to fix it"
     }
   ],
-  "comment": "...",
+  "comment": "Brief overall review summary",
   "decision": "approve|request_changes|reject"
 }
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _env_post(path: str, **kwargs) -> dict:
-    r = requests.post(f"{BASE_URL}{path}", **kwargs, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def _env_get(path: str, **kwargs) -> dict:
-    r = requests.get(f"{BASE_URL}{path}", **kwargs, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def _build_user_message(obs: dict) -> str:
-    schema_text = ""
+def build_user_prompt(obs: Dict) -> str:
+    schema_str = ""
     for tbl in obs.get("schema_context", []):
-        cols = ", ".join(
-            f"{c['name']} {c['type']}{'(nullable)' if c.get('nullable', True) else ' NOT NULL'}"
-            for c in tbl["columns"]
-        )
-        indexes = ", ".join(tbl.get("has_index_on", []))
-        constraints = "; ".join(tbl.get("constraints", []))
-        row_hint = tbl.get("row_count_hint", 0)
-        schema_text += (
-            f"\nTable: {tbl['table_name']} (~{row_hint:,} rows)\n"
-            f"  Columns: {cols}\n"
-            f"  Indexes: {indexes or 'none'}\n"
-        )
-        if constraints:
-            schema_text += f"  Constraints: {constraints}\n"
+        cols = ", ".join(f"{c['name']} {c['type']}" for c in tbl["columns"])
+        idx = ", ".join(tbl.get("has_index_on", []))
+        rows = tbl.get("row_count_hint", "unknown")
+        schema_str += f"\nTable: {tbl['table_name']} (~{rows:,} rows)\n  Columns: {cols}\n  Indexes: {idx}\n"
 
-    return (
-        f"## Task Instructions\n{obs['task_instructions']}\n\n"
-        f"## SQL Query ({obs.get('query_dialect','PostgreSQL')})\n"
-        f"```sql\n{obs['query']}\n```\n\n"
-        f"## Schema\n{schema_text}"
-    )
+    prior = ""
+    for item in obs.get("review_thread", []):
+        if item.get("type") == "issue":
+            prior += f"  - [{item['severity']}] {item['category']}: {item['description']}\n"
 
-def _call_llm(client: OpenAI, user_msg: str, retry: int = 3) -> dict:
-    for attempt in range(retry):
-        try:
-            response = client.chat.completions.create(
-                model    = MODEL,
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_msg},
-                ],
-                temperature = 0.1,
-                max_tokens  = 1200,
-            )
-            raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = "\n".join(raw.split("\n")[1:])
-            if raw.endswith("```"):
-                raw = "\n".join(raw.split("\n")[:-1])
-            return json.loads(raw.strip())
-        except json.JSONDecodeError as e:
-            print(f"  [warn] JSON parse error (attempt {attempt+1}): {e}")
-            time.sleep(1)
-        except Exception as e:
-            print(f"  [warn] LLM call error (attempt {attempt+1}): {e}")
-            time.sleep(2)
-    return {"issues": [], "comment": "LLM failed to respond.", "decision": "approve"}
+    return f"""Task: {obs['task_instructions']}
+
+=== SQL Query ({obs['query_dialect']}) ===
+{obs['query']}
+
+=== Schema Context ===
+{schema_str}
+
+=== Issues Already Identified ===
+{prior if prior else '  (none yet)'}
+
+Identify ALL remaining issues and provide your final decision."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Run one task
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_task(task_id: str, client: OpenAI) -> dict[str, Any]:
+def run_agent(task_id: str) -> Dict:
     print(f"\n{'='*60}")
     print(f"Task: {task_id}")
-    print(f"{'='*60}")
 
-    obs = _env_post("/reset", params={"task_id": task_id})
+    obs = env_reset(task_id)
     session_id = obs["session_id"]
-    print(f"Session: {session_id}  (max_steps={obs['max_steps']})")
+    print(f"Session: {session_id}")
 
-    step_results = []
-    done = obs.get("done", False)
     step = 0
+    done = False
+    cumulative_reward = 0.0
+    all_issues = []
 
-    while not done and step < obs["max_steps"]:
+    while not done and step < MAX_STEPS:
         step += 1
-        print(f"\n--- Step {step} ---")
+        prompt = build_user_prompt(obs)
 
-        user_msg = _build_user_message(obs)
-        llm_resp = _call_llm(client, user_msg)
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content
+            agent_action = json.loads(raw)
+        except Exception as e:
+            print(f"  LLM error at step {step}: {e}")
+            break
 
-        valid_cats = {"correctness", "performance", "security", "style"}
-        valid_sevs = {"critical", "high", "medium", "low"}
-        valid_decs = {"approve", "request_changes", "reject"}
-
-        cleaned_issues = []
-        for iss in llm_resp.get("issues", []):
-            cat = iss.get("category", "correctness").lower()
-            sev = iss.get("severity", "medium").lower()
-            if cat not in valid_cats:
-                cat = "correctness"
-            if sev not in valid_sevs:
-                sev = "medium"
-            cleaned_issues.append({
-                "category":     cat,
-                "severity":     sev,
-                "description":  iss.get("description", ""),
-                "suggested_fix": iss.get("suggested_fix", ""),
-            })
-
-        decision = llm_resp.get("decision", "").lower()
-        if decision not in valid_decs:
-            decision = None
-
+        # Build action
         action = {
             "session_id": session_id,
-            "issues":     cleaned_issues,
-            "comment":    llm_resp.get("comment", ""),
-            "decision":   decision,
+            "issues": agent_action.get("issues", []),
+            "comment": agent_action.get("comment"),
+            "decision": agent_action.get("decision"),
         }
 
-        print(f"  Issues submitted: {len(cleaned_issues)}")
-        print(f"  Decision: {decision}")
-
-        result = _env_post("/step", json=action)
-        obs    = result["observation"]
+        result = env_step(action)
+        obs = result["observation"]
         reward = result["reward"]
-        done   = result["done"]
+        done = result["done"]
+        cumulative_reward = reward["cumulative"]
+        all_issues.extend(agent_action.get("issues", []))
 
-        print(f"  Reward: {reward['value']:.4f}  (cumulative={reward['cumulative']:.4f})")
-        step_results.append({
-            "step":     step,
-            "n_issues": len(cleaned_issues),
-            "decision": decision,
-            "reward":   reward["value"],
-        })
+        print(f"  Step {step}: reward={reward['value']:.3f} cumulative={cumulative_reward:.3f} done={done}")
+        if agent_action.get("decision"):
+            print(f"  Decision: {agent_action['decision']}")
 
-    grader = _env_get("/grader", params={"session_id": session_id})
-    print(f"\nFinal score: {grader['score']:.4f}")
+    # Grade
+    score = env_grade(session_id)
+    print(f"  Final score: {score:.4f}")
+    print(f"  Issues found: {len(all_issues)}")
 
     return {
-        "task_id":      task_id,
-        "session_id":   session_id,
-        "score":        grader["score"],
-        "breakdown":    grader.get("breakdown", {}),
-        "step_results": step_results,
-        "model":        MODEL,
+        "task_id": task_id,
+        "score": score,
+        "steps": step,
+        "cumulative_reward": cumulative_reward,
+        "issues_found": len(all_issues),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Run LLM inference against SQL Review OpenEnv")
-    parser.add_argument("--task", default="all", help="Task ID or 'all'")
-    parser.add_argument("--output", default="baseline_results.json")
-    args = parser.parse_args()
-
-    # Validate required env vars
-    missing = []
-    if not API_KEY:
-        missing.append("HF_TOKEN (or OPENAI_API_KEY)")
-    if not os.getenv("API_BASE_URL"):
-        print(f"[warn] API_BASE_URL not set, defaulting to {BASE_URL}")
-    if not os.getenv("MODEL_NAME"):
-        print(f"[warn] MODEL_NAME not set, defaulting to {MODEL}")
-    if missing:
-        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+    if not OPENAI_API_KEY:
+        print("ERROR: OPENAI_API_KEY not set.")
         sys.exit(1)
 
     # Verify environment is reachable
     try:
-        health = requests.get(f"{BASE_URL}/health", timeout=10).json()
-        print(f"Environment: {BASE_URL}  status={health.get('status')}")
+        resp = requests.get(f"{BASE_URL}/health", timeout=10)
+        resp.raise_for_status()
+        print(f"Environment health: {resp.json()}")
     except Exception as e:
-        print(f"ERROR: Cannot reach environment at {BASE_URL}: {e}")
+        print(f"Cannot reach environment at {BASE_URL}: {e}")
         sys.exit(1)
 
-    client = OpenAI(api_key=API_KEY)
+    tasks = ["easy_correctness", "medium_performance", "hard_security"]
+    results = []
 
-    # Determine tasks to run
-    if args.task == "all":
-        tasks_response = requests.get(f"{BASE_URL}/tasks", timeout=10).json()
-        task_ids = [t["id"] for t in tasks_response["tasks"]]
-    else:
-        task_ids = [args.task]
-
-    print(f"Running {len(task_ids)} task(s) with model={MODEL}\n")
-
-    all_results = []
-    for tid in task_ids:
-        result = run_task(tid, client)
-        all_results.append(result)
-        time.sleep(0.5)
-
-    avg = round(sum(r["score"] for r in all_results) / len(all_results), 4)
-
-    summary = {
-        "model":         MODEL,
-        "environment":   BASE_URL,
-        "average_score": avg,
-        "results":       all_results,
-    }
-
-    with open(args.output, "w") as f:
-        json.dump(summary, f, indent=2)
+    for task_id in tasks:
+        try:
+            result = run_agent(task_id)
+            results.append(result)
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error on {task_id}: {e}")
+            results.append({"task_id": task_id, "score": 0.0, "error": str(e)})
 
     print(f"\n{'='*60}")
-    print(f"Average score: {avg:.4f}")
-    print(f"Results written to: {args.output}")
+    print("BASELINE RESULTS")
     print(f"{'='*60}")
-    print(f"\n{'Task':<30} {'Score':>6}")
-    print("-" * 38)
-    for r in all_results:
-        print(f"{r['task_id']:<30} {r['score']:>6.4f}")
+    for r in results:
+        score = r.get("score", 0.0)
+        print(f"  {r['task_id']:30s}  score={score:.4f}")
+
+    avg = sum(r.get("score", 0.0) for r in results) / len(results)
+    print(f"\n  Average score: {avg:.4f}")
+    print(f"{'='*60}\n")
+
+    # Write results JSON for CI
+    with open("baseline_results.json", "w") as f:
+        json.dump({"results": results, "average": avg}, f, indent=2)
+    print("Results written to baseline_results.json")
 
 
 if __name__ == "__main__":
