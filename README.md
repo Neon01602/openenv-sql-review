@@ -1,17 +1,4 @@
----
-title: SQL Query Review OpenEnv
-emoji: 🗄️
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-pinned: false
-tags:
-  - openenv
-  - reinforcement-learning
-  - sql
-  - code-review
-app_port: 7860
----
+
 
 # SQL Query Review — OpenEnv Environment v2.0
 
