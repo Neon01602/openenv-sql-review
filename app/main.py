@@ -4,17 +4,15 @@ SQL Query Review Environment — OpenEnv compliant FastAPI application.
 
 from __future__ import annotations
 
-import os
-import time
 import uuid
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import Action, Observation, Reward, TaskInfo
-from .session import SessionManager
-from .tasks import TASK_REGISTRY
+from .models import Action, Observation, Reward
+from .session import create_episode, get_episode
+from .tasks import TASK_MAP, list_tasks as _list_tasks, ACTION_SCHEMA
 
 app = FastAPI(
     title="SQL Query Review — OpenEnv",
@@ -30,29 +28,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-sessions = SessionManager()
-
 
 @app.post("/reset", response_model=Observation)
 def reset(task_id: Optional[str] = None):
     """Start a new episode. Returns the initial observation."""
     if task_id is None:
         task_id = "easy_correctness"
-    if task_id not in TASK_REGISTRY:
+    if task_id not in TASK_MAP and not task_id.startswith("generated_"):
         raise HTTPException(status_code=404, detail=f"Unknown task_id: {task_id}")
-    task = TASK_REGISTRY[task_id]
-    session_id = str(uuid.uuid4())
-    obs = sessions.new_session(session_id, task)
-    return obs
+    ep = create_episode(task_id)
+    return ep.initial_observation()
 
 
 @app.post("/step", response_model=dict)
 def step(action: Action):
     """Apply an agent action to the current episode."""
-    session = sessions.get(action.session_id)
-    if session is None:
+    try:
+        ep = get_episode(action.session_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
-    obs, reward, done, info = session.step(action)
+    obs, reward, done, info = ep.step(action)
     return {
         "observation": obs.model_dump(),
         "reward": reward.model_dump(),
@@ -64,38 +59,31 @@ def step(action: Action):
 @app.get("/state")
 def state(session_id: str):
     """Return the full current state of an episode."""
-    session = sessions.get(session_id)
-    if session is None:
+    try:
+        ep = get_episode(session_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found.")
-    return session.get_state()
+    return ep.state()
 
 
 @app.get("/tasks")
-def list_tasks():
+def list_tasks_endpoint():
     """Return all tasks and the action schema."""
     return {
-        "tasks": [
-            {
-                "id": tid,
-                "name": t.name,
-                "difficulty": t.difficulty,
-                "description": t.description,
-                "max_steps": t.max_steps,
-            }
-            for tid, t in TASK_REGISTRY.items()
-        ],
-        "action_schema": Action.model_json_schema(),
+        "tasks": _list_tasks(),
+        "action_schema": ACTION_SCHEMA,
     }
 
 
 @app.get("/grader")
 def grader(session_id: str):
     """Return the grader score for a completed episode."""
-    session = sessions.get(session_id)
-    if session is None:
+    try:
+        ep = get_episode(session_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail="Session not found.")
-    score = session.grade()
-    return {"session_id": session_id, "score": score, "task_id": session.task.task_id}
+    result = ep.grade()
+    return result.model_dump()
 
 
 @app.post("/baseline")
@@ -108,7 +96,6 @@ def baseline():
 
 @app.get("/health")
 def health():
-    # openenv validate requires "healthy" not "ok"
     return {"status": "healthy", "version": "1.0.0"}
 
 
@@ -123,7 +110,7 @@ def metadata():
         ),
         "version": "1.0.0",
         "spec": "openenv-v1",
-        "tasks": list(TASK_REGISTRY.keys()),
+        "tasks": list(TASK_MAP.keys()),
         "endpoints": [
             "/reset", "/step", "/state", "/tasks", "/grader",
             "/baseline", "/health", "/metadata", "/schema", "/mcp",
@@ -141,15 +128,16 @@ def schema():
         "state": {
             "type": "object",
             "properties": {
-                "session_id":        {"type": "string"},
-                "task_id":           {"type": "string"},
-                "step_number":       {"type": "integer"},
-                "max_steps":         {"type": "integer"},
-                "done":              {"type": "boolean"},
+                "session_id": {"type": "string"},
+                "task_id": {"type": "string"},
+                "step_number": {"type": "integer"},
+                "max_steps": {"type": "integer"},
+                "done": {"type": "boolean"},
                 "cumulative_reward": {"type": "number"},
-                "agent_issues":      {"type": "array"},
-                "agent_decision":    {"type": ["string", "null"]},
-                "grade":             {"type": ["number", "null"]},
+                "gt_detected": {"type": "integer"},
+                "gt_total": {"type": "integer"},
+                "false_positives": {"type": "integer"},
+                "final_decision": {"type": ["string", "null"]},
             },
         },
     }
@@ -163,9 +151,9 @@ def mcp(request: dict = {}):
         "id": request.get("id", 1),
         "result": {
             "tools": [
-                {"name": "reset",  "description": "Start a new episode"},
-                {"name": "step",   "description": "Apply an agent action"},
-                {"name": "state",  "description": "Get current episode state"},
+                {"name": "reset", "description": "Start a new episode"},
+                {"name": "step", "description": "Apply an agent action"},
+                {"name": "state", "description": "Get current episode state"},
                 {"name": "grader", "description": "Get final episode score"},
             ]
         },
