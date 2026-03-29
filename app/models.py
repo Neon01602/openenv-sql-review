@@ -65,6 +65,15 @@ class Observation(BaseModel):
     done:              bool = False
 
 
+# ── TaskInfo ────────────────────────────────────────────────────────────────
+
+class TaskInfo(BaseModel):
+    task_id: str
+    name: str
+    difficulty: str
+    description: str
+    max_steps: int
+
 # ── Action ───────────────────────────────────────────────────────────────────
 
 class Action(BaseModel):
