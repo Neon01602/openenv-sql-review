@@ -1,11 +1,5 @@
 """
 SQL Query Review Environment — OpenEnv compliant FastAPI application.
-
-Domain: SQL code review. An agent acts as a senior data engineer reviewing
-submitted SQL queries for correctness, performance anti-patterns, and
-security vulnerabilities (SQL injection risks).
-
-This simulates a genuine daily workflow in data engineering teams.
 """
 
 from __future__ import annotations
@@ -16,7 +10,7 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from .models import Action, Observation, Reward, TaskInfo
 from .session import SessionManager
@@ -28,12 +22,15 @@ app = FastAPI(
     version="1.0.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 sessions = SessionManager()
-
-
-# ─────────────────────────────────────────────
-# Core OpenEnv endpoints
-# ─────────────────────────────────────────────
 
 
 @app.post("/reset", response_model=Observation)
@@ -43,7 +40,6 @@ def reset(task_id: Optional[str] = None):
         task_id = "easy_correctness"
     if task_id not in TASK_REGISTRY:
         raise HTTPException(status_code=404, detail=f"Unknown task_id: {task_id}")
-
     task = TASK_REGISTRY[task_id]
     session_id = str(uuid.uuid4())
     obs = sessions.new_session(session_id, task)
@@ -52,14 +48,10 @@ def reset(task_id: Optional[str] = None):
 
 @app.post("/step", response_model=dict)
 def step(action: Action):
-    """
-    Apply an agent action to the current episode.
-    Returns observation, reward, done, info.
-    """
+    """Apply an agent action to the current episode."""
     session = sessions.get(action.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
-
     obs, reward, done, info = session.step(action)
     return {
         "observation": obs.model_dump(),
@@ -76,11 +68,6 @@ def state(session_id: str):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     return session.get_state()
-
-
-# ─────────────────────────────────────────────
-# Required extra endpoints
-# ─────────────────────────────────────────────
 
 
 @app.get("/tasks")
@@ -113,19 +100,76 @@ def grader(session_id: str):
 
 @app.post("/baseline")
 def baseline():
-    """
-    Run the built-in heuristic baseline agent across all 3 tasks.
-    Returns reproducible scores (no LLM needed for the baseline gate).
-    """
+    """Run the built-in heuristic baseline agent across all tasks."""
     from .baseline import run_heuristic_baseline
-
     results = run_heuristic_baseline()
     return {"baseline_results": results}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": time.time()}
+    # openenv validate requires "healthy" not "ok"
+    return {"status": "healthy", "version": "1.0.0"}
+
+
+@app.get("/metadata")
+def metadata():
+    """Environment metadata — required by openenv validate."""
+    return {
+        "name": "SQL Query Review",
+        "description": (
+            "An OpenEnv environment that trains agents to review SQL queries "
+            "for correctness bugs, performance anti-patterns, and security vulnerabilities."
+        ),
+        "version": "1.0.0",
+        "spec": "openenv-v1",
+        "tasks": list(TASK_REGISTRY.keys()),
+        "endpoints": [
+            "/reset", "/step", "/state", "/tasks", "/grader",
+            "/baseline", "/health", "/metadata", "/schema", "/mcp",
+        ],
+        "docs": "/docs",
+    }
+
+
+@app.get("/schema")
+def schema():
+    """Action, observation, and state schemas — required by openenv validate."""
+    return {
+        "action": Action.model_json_schema(),
+        "observation": Observation.model_json_schema(),
+        "state": {
+            "type": "object",
+            "properties": {
+                "session_id":        {"type": "string"},
+                "task_id":           {"type": "string"},
+                "step_number":       {"type": "integer"},
+                "max_steps":         {"type": "integer"},
+                "done":              {"type": "boolean"},
+                "cumulative_reward": {"type": "number"},
+                "agent_issues":      {"type": "array"},
+                "agent_decision":    {"type": ["string", "null"]},
+                "grade":             {"type": ["number", "null"]},
+            },
+        },
+    }
+
+
+@app.post("/mcp")
+def mcp(request: dict = {}):
+    """JSON-RPC 2.0 endpoint — required by openenv validate."""
+    return {
+        "jsonrpc": "2.0",
+        "id": request.get("id", 1),
+        "result": {
+            "tools": [
+                {"name": "reset",  "description": "Start a new episode"},
+                {"name": "step",   "description": "Apply an agent action"},
+                {"name": "state",  "description": "Get current episode state"},
+                {"name": "grader", "description": "Get final episode score"},
+            ]
+        },
+    }
 
 
 @app.get("/")
@@ -134,5 +178,8 @@ def root():
         "environment": "SQL Query Review",
         "version": "1.0.0",
         "spec": "openenv-v1",
-        "endpoints": ["/reset", "/step", "/state", "/tasks", "/grader", "/baseline", "/health"],
+        "endpoints": [
+            "/reset", "/step", "/state", "/tasks", "/grader",
+            "/baseline", "/health", "/metadata", "/schema", "/mcp",
+        ],
     }
