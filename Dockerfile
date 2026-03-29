@@ -2,16 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies first (cached layer)
+# Install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir openenv-core
 
-# Copy application code
+# Copy all application code
 COPY app/         ./app/
-COPY tests/       ./tests/
+COPY server/      ./server/
 COPY openenv.yaml .
 COPY README.md    .
-# inference.py must be at root per submission rules
+COPY pyproject.toml .
 COPY inference.py .
 
 # Hugging Face Spaces runs as non-root
